@@ -9,12 +9,15 @@ import requests
 
 
 WORLD_BANK_COUNTRIES_BASE = "https://api.worldbank.org/v2/country?format=json"
-WORLD_BANK_INDICATOR_BASE = "https://api.worldbank.org/v2/country/all/indicator/{code}?format=json&date={start}:{end}"
+WORLD_BANK_INDICATOR_BASE = (
+    "https://api.worldbank.org/v2/country/all/indicator/{code}?format=json&date={start}:{end}"
+)
 RESTCOUNTRIES_URL = (
     "https://restcountries.com/v3.1/all"
     "?fields=name,cca3,region,subregion,capital,latlng,population"
 )
 
+# World Bank indicators (population is handled specially to avoid merge artefacts)
 INDICATORS = {
     "population": "SP.POP.TOTL",
     "gdp_usd": "NY.GDP.MKTP.CD",
@@ -196,6 +199,38 @@ def latest_by_country(df: pd.DataFrame, value_name: str) -> pd.DataFrame:
     return d[["iso3", value_name, f"{value_name}_year"]]
 
 
+def normalize_population_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Produces a clean population schema:
+      - population_master (RestCountries if present)
+      - population_wb + population_year (World Bank indicator if present)
+      - population (preferred: WB, fallback: master)
+      - population_source
+    """
+    if "population" in df.columns and "population_master" not in df.columns:
+        df = df.rename(columns={"population": "population_master"})
+
+    if "population_wb_year" in df.columns and "population_year" not in df.columns:
+        df = df.rename(columns={"population_wb_year": "population_year"})
+
+    if "population_wb" not in df.columns:
+        df["population_wb"] = pd.NA
+    if "population_master" not in df.columns:
+        df["population_master"] = pd.NA
+    if "population_year" not in df.columns:
+        df["population_year"] = pd.NA
+
+    df["population"] = df["population_wb"].combine_first(df["population_master"])
+
+    df["population_source"] = pd.Series(pd.NA, index=df.index, dtype="string")
+    df.loc[df["population_wb"].notna(), "population_source"] = "world_bank"
+    df.loc[df["population_wb"].isna() & df["population_master"].notna(), "population_source"] = "master"
+
+    df.loc[df["population_wb"].isna(), "population_year"] = pd.NA
+
+    return df
+
+
 def run_quality_checks(final_df: pd.DataFrame) -> Tuple[bool, pd.DataFrame]:
     checks = []
 
@@ -231,16 +266,25 @@ def main() -> None:
 
     print("2) Pulling indicators (best-effort) from World Bank…")
     start_year, end_year = 2010, datetime.now(timezone.utc).year
-    indicator_latest_frames = []
+    indicator_latest_frames: List[pd.DataFrame] = []
 
     for name, code in INDICATORS.items():
         try:
             print(f"   - {name} ({code})")
             ind = fetch_indicator_bulk(code, start_year, end_year)
             ind.to_csv(os.path.join(raw_dir, f"indicator_{name}.csv"), index=False)
-            indicator_latest_frames.append(latest_by_country(ind, name))
+
+            if name == "population":
+                pop_latest = latest_by_country(ind, "population_wb")
+                indicator_latest_frames.append(pop_latest)
+            else:
+                indicator_latest_frames.append(latest_by_country(ind, name))
+
         except Exception:
-            indicator_latest_frames.append(pd.DataFrame(columns=["iso3", name, f"{name}_year"]))
+            if name == "population":
+                indicator_latest_frames.append(pd.DataFrame(columns=["iso3", "population_wb", "population_wb_year"]))
+            else:
+                indicator_latest_frames.append(pd.DataFrame(columns=["iso3", name, f"{name}_year"]))
 
     print("3) Merging datasets…")
     final_df = countries.copy()
@@ -248,6 +292,8 @@ def main() -> None:
     for frame in indicator_latest_frames:
         if "iso3" in frame.columns and frame.shape[0] > 0:
             final_df = final_df.merge(frame, on="iso3", how="left")
+
+    final_df = normalize_population_schema(final_df)
 
     as_of = datetime.now(timezone.utc).isoformat(timespec="seconds")
     final_df["as_of_utc"] = as_of

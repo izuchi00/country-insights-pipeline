@@ -7,5 +7,6 @@ __pycache__/
 .DS_Store
 .vscode/
 
-# Data (keep processed, ignore raw)
-data/raw/
+# Data (ignore raw files but keep the folder)
+data/raw/*
+!data/raw/.gitkeep
